@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# new-app — wire a GitHub repo to Coolify in one command.
+#
+# Creates the Coolify resource, loads its runtime env vars from a .env file,
+# and sets the two things the repo's deploy workflow needs:
+#   COOLIFY_TOKEN    repo secret    (the same token everywhere)
+#   COOLIFY_WEBHOOK  repo variable  (this repo's deploy URL — not secret,
+#                                    useless without the token)
+#
+# Written for macOS's bash 3.2: no associative arrays, no ${var,,}.
+set -euo pipefail
+
+KEYCHAIN_URL=new-app.coolify-url
+KEYCHAIN_TOKEN=new-app.coolify-token
+
+usage() {
+  cat <<'EOF'
+new-app — wire a GitHub repo to Coolify
+
+  new-app setup                          store Coolify URL + API token in the macOS keychain
+  new-app create <owner/repo> [options]  create the Coolify resource and wire the repo
+  new-app link   <owner/repo> <uuid>     wire a repo to an existing Coolify resource
+  new-app env    <uuid> <file>           (re)load a .env file into an existing resource
+  new-app sync-token [owner]             push the current token to every wired repo
+
+create options:
+  --env FILE        runtime env vars to load into Coolify (.env format)
+  --compose FILE    deploy a Docker Compose stack instead of a single image
+  --image NAME      GHCR image name (default: repo name)
+  --port PORT       container port to expose (default: 3000; single image only)
+  --domain URL      e.g. https://foo.example.com (single image only; else set it in Coolify)
+  --project NAME    Coolify project (default: repo name; created if missing)
+  --env-name NAME   Coolify environment (default: production)
+  --server UUID     Coolify server (default: the only server)
+
+Config comes from COOLIFY_URL / COOLIFY_TOKEN if set, else the keychain
+(see `new-app setup`).
+EOF
+}
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+warn() { printf '\033[33mwarn:\033[0m %s\n' "$*" >&2; }
+info() { printf '\033[36m→\033[0m %s\n' "$*" >&2; }
+ok()   { printf '\033[32m✓\033[0m %s\n' "$*" >&2; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed"; }
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+keychain_get() {
+  command -v security >/dev/null 2>&1 || return 0
+  security find-generic-password -s "$1" -a "$USER" -w 2>/dev/null || true
+}
+
+load_config() {
+  COOLIFY_URL="${COOLIFY_URL:-$(keychain_get "$KEYCHAIN_URL")}"
+  COOLIFY_TOKEN="${COOLIFY_TOKEN:-$(keychain_get "$KEYCHAIN_TOKEN")}"
+  COOLIFY_URL="${COOLIFY_URL%/}"
+  [ -n "$COOLIFY_URL" ]   || die "Coolify URL not set. Run 'new-app setup' or export COOLIFY_URL."
+  [ -n "$COOLIFY_TOKEN" ] || die "Coolify token not set. Run 'new-app setup' or export COOLIFY_TOKEN."
+}
+
+# api METHOD PATH [JSON]  → prints the response body; dies on non-2xx.
+# The token goes in via a header file so it never shows up in `ps`.
+api() {
+  local method=$1 path=$2 data=${3-} out code
+  out=$(mktemp)
+  local args=(-sS -o "$out" -w '%{http_code}' -X "$method" -H 'Accept: application/json')
+  if [ -n "$data" ]; then
+    args+=(-H 'Content-Type: application/json' --data-binary "$data")
+  fi
+  # The <(...) must sit on the curl line itself: an fd created in an earlier
+  # assignment can already be closed by the time curl reads it.
+  code=$(curl "${args[@]}" -H @<(printf 'Authorization: Bearer %s\n' "$COOLIFY_TOKEN") \
+    "$COOLIFY_URL/api/v1$path") || code=000
+  if [ "${code:0:1}" != 2 ]; then
+    printf '\033[31merror:\033[0m %s %s → HTTP %s\n' "$method" "$path" "$code" >&2
+    head -c 2000 "$out" >&2 2>/dev/null; echo >&2
+    rm -f "$out"
+    case "$code" in
+      401) die "token rejected — run 'new-app setup' with a valid token" ;;
+      403) die "token lacks permission for this (it needs read + write + deploy)" ;;
+      000) die "could not reach $COOLIFY_URL" ;;
+      *)   exit 1 ;;
+    esac
+  fi
+  cat "$out"; rm -f "$out"
+}
+
+# env_json FILE → {"data":[{key,value,is_literal}, ...]} for the bulk env API.
+# Handles comments, blank lines, `export `, and surrounding quotes.
+# Multi-line values are not supported — set those in the Coolify UI.
+env_json() {
+  local file=$1 line key val n=0
+  [ -f "$file" ] || die "env file not found: $file"
+  {
+    while IFS= read -r line || [ -n "$line" ]; do
+      n=$((n + 1))
+      line=${line%$'\r'}
+      case "$line" in ''|'#'*) continue ;; esac
+      [[ $line =~ ^[[:space:]]*$ ]] && continue
+      [[ $line =~ ^[[:space:]]*# ]] && continue
+      line=${line#export }
+      if [[ $line != *=* ]]; then warn "$file:$n has no '=', skipped"; continue; fi
+      key=${line%%=*}; val=${line#*=}
+      key=$(printf '%s' "$key" | tr -d '[:space:]')
+      [[ $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { warn "$file:$n bad key '$key', skipped"; continue; }
+      if [[ $val =~ ^\"(.*)\"$ ]] || [[ $val =~ ^\'(.*)\'$ ]]; then val=${BASH_REMATCH[1]}; fi
+      # is_literal stops Coolify from interpolating a value that contains `$`.
+      jq -cn --arg k "$key" --arg v "$val" '{key: $k, value: $v, is_literal: ($v | contains("$"))}'
+    done < "$file"
+  } | jq -cs '{data: .}'
+}
+
+script_dir() {
+  local src=${BASH_SOURCE[0]}
+  while [ -L "$src" ]; do
+    local dir; dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src"); [[ $src != /* ]] && src=$dir/$src
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+
+# ---------------------------------------------------------------- commands --
+
+cmd_setup() {
+  need security
+  local url
+  printf 'Coolify URL (e.g. https://coolify.example.com): ' >&2
+  read -r url
+  url=${url%/}
+  [ -n "$url" ] || die "URL is required"
+  security add-generic-password -U -s "$KEYCHAIN_URL" -a "$USER" -w "$url"
+  info "Paste a Coolify API token (Keys & Tokens → API tokens; needs read, write and deploy)."
+  info "macOS will ask for it twice; it is not echoed."
+  security add-generic-password -U -s "$KEYCHAIN_TOKEN" -a "$USER" -w
+  COOLIFY_URL='' COOLIFY_TOKEN=''
+  load_config
+  local version; version=$(api GET /version)
+  ok "Saved. Coolify $version at $COOLIFY_URL"
+}
+
+# wire REPO UUID [IMAGE] — set the secret + variable, drop in the workflow.
+wire() {
+  local repo=$1 uuid=$2 image=${3-} webhook
+  webhook="$COOLIFY_URL/api/v1/deploy?uuid=$uuid&force=false"
+  gh variable set COOLIFY_WEBHOOK --repo "$repo" --body "$webhook" >/dev/null
+  ok "variable COOLIFY_WEBHOOK set on $repo"
+  printf '%s' "$COOLIFY_TOKEN" | gh secret set COOLIFY_TOKEN --repo "$repo" >/dev/null
+  ok "secret COOLIFY_TOKEN set on $repo"
+
+  local here template target=.github/workflows/deploy.yml
+  template="$(script_dir)/../templates/deploy.yml"
+  here=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)
+  if [ "$(lower "$here")" != "$(lower "$repo")" ]; then
+    info "Not inside a checkout of $repo — copy $template to $target there."
+  elif [ -e "$target" ]; then
+    info "$target already exists; left alone. To switch it over, replace it with $template"
+    info "(or swap its curl step for: uses: Otagera/workflows/deploy@main)."
+  else
+    mkdir -p "$(dirname "$target")"
+    if [ -n "$image" ]; then
+      sed "s|      # image: my-image          # default: repo name|      image: $image|" "$template" > "$target"
+    else
+      cp "$template" "$target"
+    fi
+    ok "wrote $target — review, commit and push to deploy"
+  fi
+}
+
+cmd_create() {
+  local repo=${1-}; [ -n "$repo" ] || { usage; exit 1; }
+  [[ $repo == */* ]] || die "repo must be owner/name, got '$repo'"
+  shift
+  local env_file='' compose='' image='' port=3000 domain='' project='' env_name=production server=''
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --env)      env_file=${2-};  shift 2 ;;
+      --compose)  compose=${2-};   shift 2 ;;
+      --image)    image=${2-};     shift 2 ;;
+      --port)     port=${2-};      shift 2 ;;
+      --domain)   domain=${2-};    shift 2 ;;
+      --project)  project=${2-};   shift 2 ;;
+      --env-name) env_name=${2-};  shift 2 ;;
+      --server)   server=${2-};    shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  local name=${repo#*/} owner=${repo%%/*}
+  image=$(lower "${image:-$name}")
+  project=${project:-$name}
+  [ -z "$env_file" ] || [ -f "$env_file" ] || die "env file not found: $env_file"
+  [ -z "$compose" ]  || [ -f "$compose" ]  || die "compose file not found: $compose"
+  gh repo view "$repo" --json name >/dev/null 2>&1 || die "GitHub repo $repo not found (or gh not logged in)"
+
+  # Server: the only one, unless told otherwise.
+  if [ -z "$server" ]; then
+    local servers count
+    servers=$(api GET /servers)
+    count=$(jq length <<<"$servers")
+    [ "$count" -ge 1 ] || die "no servers in Coolify"
+    if [ "$count" -gt 1 ]; then
+      jq -r '.[] | "  \(.uuid)  \(.name)"' <<<"$servers" >&2
+      die "several servers — pick one with --server <uuid>"
+    fi
+    server=$(jq -r '.[0].uuid' <<<"$servers")
+  fi
+
+  # Project: find by name, create if missing (new projects get a 'production' env).
+  local project_uuid
+  project_uuid=$(api GET /projects | jq -r --arg n "$project" '[.[] | select(.name == $n)][0].uuid // empty')
+  if [ -z "$project_uuid" ]; then
+    project_uuid=$(api POST /projects "$(jq -cn --arg n "$project" '{name: $n}')" | jq -r .uuid)
+    ok "created Coolify project '$project'"
+  else
+    info "using existing Coolify project '$project'"
+  fi
+
+  local uuid kind body
+  if [ -n "$compose" ]; then
+    kind=services
+    body=$(jq -cn --arg p "$project_uuid" --arg s "$server" --arg e "$env_name" --arg n "$name" \
+      --arg c "$(base64 < "$compose" | tr -d '\n')" \
+      '{project_uuid: $p, server_uuid: $s, environment_name: $e, name: $n,
+        docker_compose_raw: $c, instant_deploy: false}')
+    uuid=$(api POST /services "$body" | jq -r .uuid)
+    ok "created Compose service '$name' ($uuid)"
+  else
+    kind=applications
+    body=$(jq -cn --arg p "$project_uuid" --arg s "$server" --arg e "$env_name" --arg n "$name" \
+      --arg i "ghcr.io/$(lower "$owner")/$image" --arg port "$port" --arg d "$domain" \
+      '{project_uuid: $p, server_uuid: $s, environment_name: $e, name: $n,
+        docker_registry_image_name: $i, docker_registry_image_tag: "latest",
+        ports_exposes: $port, instant_deploy: false}
+       + (if $d == "" then {} else {domains: $d} end)')
+    uuid=$(api POST /applications/dockerimage "$body" | jq -r .uuid)
+    ok "created app '$name' from ghcr.io/$(lower "$owner")/$image:latest ($uuid)"
+  fi
+
+  if [ -n "$env_file" ]; then
+    local envs; envs=$(env_json "$env_file")
+    api PATCH "/$kind/$uuid/envs/bulk" "$envs" >/dev/null
+    ok "loaded $(jq '.data | length' <<<"$envs") env vars from $env_file"
+  fi
+
+  local image_arg=''
+  [ "$image" != "$(lower "$name")" ] && image_arg=$image
+  wire "$repo" "$uuid" "$image_arg"
+
+  echo >&2
+  ok "Done. Push to main and GitHub builds the image, then Coolify deploys it."
+  [ -n "$domain" ] || [ -n "$compose" ] || info "No --domain given: set one in Coolify before the first deploy."
+}
+
+cmd_link() {
+  local repo=${1-} uuid=${2-}
+  [ -n "$repo" ] && [ -n "$uuid" ] || { usage; exit 1; }
+  wire "$repo" "$uuid"
+}
+
+cmd_env() {
+  local uuid=${1-} file=${2-} envs kind
+  [ -n "$uuid" ] && [ -n "$file" ] || { usage; exit 1; }
+  envs=$(env_json "$file")
+  # The uuid may be an application or a Compose service; try both.
+  if (api GET "/applications/$uuid" >/dev/null 2>&1); then kind=applications; else kind=services; fi
+  api PATCH "/$kind/$uuid/envs/bulk" "$envs" >/dev/null
+  ok "loaded $(jq '.data | length' <<<"$envs") env vars into $kind/$uuid (redeploy to apply)"
+}
+
+cmd_sync_token() {
+  local owner=${1:-$(gh api user -q .login)} repo n=0
+  info "Updating COOLIFY_TOKEN on every $owner repo that already has it or a COOLIFY_WEBHOOK variable…"
+  while IFS= read -r repo; do
+    if gh secret list --repo "$repo" 2>/dev/null | grep -q '^COOLIFY_TOKEN' \
+       || gh variable get COOLIFY_WEBHOOK --repo "$repo" >/dev/null 2>&1; then
+      printf '%s' "$COOLIFY_TOKEN" | gh secret set COOLIFY_TOKEN --repo "$repo" >/dev/null
+      ok "$repo"; n=$((n + 1))
+    fi
+  done < <(gh repo list "$owner" --no-archived --source --limit 500 --json nameWithOwner -q '.[].nameWithOwner')
+  ok "updated $n repos"
+}
+
+# ------------------------------------------------------------------- main --
+
+need curl; need jq; need gh
+case "${1-}" in
+  setup)      shift; cmd_setup "$@" ;;
+  create)     shift; load_config; cmd_create "$@" ;;
+  link)       shift; load_config; cmd_link "$@" ;;
+  env)        shift; load_config; cmd_env "$@" ;;
+  sync-token) shift; load_config; cmd_sync_token "$@" ;;
+  ''|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

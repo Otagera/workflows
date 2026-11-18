@@ -1,0 +1,33 @@
+name: Deploy
+
+# Build the image, push it to GHCR, redeploy on Coolify.
+# The logic lives in Otagera/workflows; this file only says "use it".
+# Wired by `new-app`: COOLIFY_TOKEN (secret) + COOLIFY_WEBHOOK (variable).
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # Add your checks here and uncomment `needs: test` below.
+  # test:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v7
+  #     - run: npm ci && npm test
+
+  deploy:
+    # needs: test
+    uses: Otagera/workflows/.github/workflows/build-deploy.yml@main
+    with:
+      webhook: ${{ vars.COOLIFY_WEBHOOK }}
+      # image: my-image          # default: repo name
+      # build-args: |
+      #   VITE_API_URL=https://api.example.com
+    secrets: inherit

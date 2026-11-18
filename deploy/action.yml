@@ -1,0 +1,50 @@
+name: Coolify deploy
+description: >
+  Trigger a Coolify redeploy and turn a failure into a readable reason.
+  Skips cleanly (with a notice) when the webhook or token is not set yet,
+  so a repo can publish images before its Coolify resource exists.
+
+inputs:
+  webhook:
+    description: Coolify deploy URL, https://<coolify-host>/api/v1/deploy?uuid=<resource-uuid>&force=false
+    required: false
+    default: ''
+  token:
+    description: Coolify API token with the deploy ability
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Trigger Coolify redeploy
+      shell: bash
+      env:
+        COOLIFY_WEBHOOK: ${{ inputs.webhook }}
+        COOLIFY_TOKEN: ${{ inputs.token }}
+      run: |
+        if [ -z "$COOLIFY_WEBHOOK" ] || [ -z "$COOLIFY_TOKEN" ]; then
+          echo "::notice::COOLIFY_WEBHOOK / COOLIFY_TOKEN not set; nothing redeployed. Run 'new-app link <repo> <uuid>' to wire this repo."
+          exit 0
+        fi
+
+        # POST, not GET: Coolify 4.3.x moved /api/v1/deploy to POST.
+        # Not `curl -f`: it hides the status and body, which are exactly what
+        # tell a bad token from a wrong URL from a wrong method.
+        out="$RUNNER_TEMP/coolify-deploy.out"
+        code="$(curl -sS -o "$out" -w '%{http_code}' -X POST --data '' \
+          -H @<(printf 'Authorization: Bearer %s\n' "$COOLIFY_TOKEN") \
+          "$COOLIFY_WEBHOOK" || echo 000)"
+        echo "HTTP $code"
+        head -c 2000 "$out" 2>/dev/null || true
+        echo
+
+        case "$code" in
+          2*)  echo "Coolify redeploy triggered — follow it in the Coolify UI." ;;
+          401) echo "::error::401 — COOLIFY_TOKEN was not accepted (revoked or mistyped). Run 'new-app sync-token'." ; exit 1 ;;
+          403) echo "::error::403 — token accepted but lacks the deploy ability, or belongs to a different Coolify team than the resource." ; exit 1 ;;
+          404) echo "::error::404 — wrong URL or unknown uuid. Expected https://<coolify-host>/api/v1/deploy?uuid=<uuid>&force=false (not a /webhooks/source/... git webhook)." ; exit 1 ;;
+          405) echo "::error::405 — wrong HTTP method for this Coolify version; the body says which." ; exit 1 ;;
+          000) echo "::error::Could not reach Coolify at all — is the host in COOLIFY_WEBHOOK reachable from GitHub?" ; exit 1 ;;
+          *)   echo "::error::Unexpected HTTP $code from Coolify." ; exit 1 ;;
+        esac
